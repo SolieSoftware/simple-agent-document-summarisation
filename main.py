@@ -2,20 +2,27 @@ import os
 from langchain_anthropic import ChatAnthropic
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.tools import Tool
-from langchain.memory import ConversationBufferMemory
+from langchain.tools import Tool, StructuredTool
 from langchain_community.document_loaders import (
     TextLoader, 
     PyPDFLoader, 
     UnstructuredWordDocumentLoader,
     CSVLoader
 )
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 import json
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import re
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+class LoadDocumentInput(BaseModel):
+    """Input for loading a document. """
+    filepath: str = Field(description="The full path to the document file")
+
+class GetDocumentInput(BaseModel):
+    """Input for retrievign document content."""
+    document_id: str = Field(description="The document ID (filename)")
 
 load_dotenv('.env.local')
 
@@ -86,7 +93,7 @@ def load_document(filepath: str):
                 ID: {doc_id}
                 Type: {metadata['type']}
                 Size: {metadata['length']} characters
-                Loaded at: {metadata['loaded_at']}
+                Upload Time: {metadata['upload_time']}
 
                 Preview (first 500 chars):
                 {text[:500]}..."""
@@ -94,7 +101,7 @@ def load_document(filepath: str):
         return f"Error loading document: {str(e)}"
 
 
-def list_loaded_documents():
+def list_loaded_documents(input: str=""):
     docs = doc_store.list_documents()
     if not docs: 
         return "No documents loaded yet."
@@ -103,5 +110,87 @@ def list_loaded_documents():
 
     for doc_id in docs:
         meta = doc_store.get_metadata(doc_id)
-        result += f"\n- {doc_id} ({meta['type']}, {meta['length']} chars, loaded: {meta['loaded_at']})"
+        result += f"\n- {doc_id} ({meta['type']}, {meta['length']} chars, loaded: {meta['upload_time']})"
     return result
+
+def search_documents(keyword: str):
+    docs = doc_store.search_documents(keyword)
+    if not docs:
+        return "No documents found."
+    
+    result = "Search Results:\n"
+    for doc_id in docs:
+        meta = doc_store.get_metadata(doc_id)
+        result += f"\n- {doc_id} ({meta['type']}, {meta['length']} chars, loaded: {meta['upload_time']})"
+    return result
+
+def get_document_content(document_id: str) -> str: 
+    content = doc_store.get_document(document_id)
+    if content is None:
+        return f"Document {document_id} not found. Use list_loaded_documents to see all loaded documents."
+    return content
+    
+
+tools = [
+      StructuredTool.from_function(
+          name="load_document",
+          func=load_document,
+          description="Load a document from a filepath. Input should be the full filepath as a string. Returns confirmation with  document ID and preview.",
+          args_schema=LoadDocumentInput
+      ),
+      Tool(
+          name="list_documents",
+          func=list_loaded_documents,
+          description="List all currently loaded documents with their metadata. No input required."
+      ),
+      StructuredTool.from_function(
+          name="get_document_content",
+          func=get_document_content,
+          description="Get the full content of a loaded document. Input should be the document ID (filename). Use this to read and analyze document contents.",
+          args_schema=GetDocumentInput,
+      ),
+  ]
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a helpful assistant that can load documents. You can:
+    - Load a document from a filepath.
+    - List loaded documents.
+    - Retrieve and analyze document content.
+    - Answer questions about the documents.
+    - Provide summaries, key insights, and extract specific information.
+
+    When a user asks you to analyze a document:
+    1. First check if it's already loaded (use list_documents).
+    2. If it's not loaded, load it using the filepath provided.
+    3. Retrieve the content using get_document_content.
+    4. Provide your analysis based on what the user asked for.
+
+    Be thorough and cite specific parts of the document in your analysis. """),
+    ("human", "{input}"),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),
+])
+
+agent = create_tool_calling_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+
+def main():
+    print("Document analysis Agent started!")
+    print("Type 'quit' to exit.\n")
+
+    while True:
+        user_input = input("\nYou: ").strip()
+        if user_input.lower() in ['quit', 'exit']:
+            print("Goodbye!")
+            break
+        
+        if not user_input:
+            continue
+        try:
+            response = agent_executor.invoke({"input": user_input})
+            print("\nAssistant: ", response['output'])
+        except Exception as e:
+            print(f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    main()
